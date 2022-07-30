@@ -1,0 +1,344 @@
+#include<iostream>
+#include <string.h>
+#include <stdio.h>
+#include <fstream>
+#include <vector>
+#include <iomanip>
+#include <memory>
+#include <stdint.h>
+#include <ctime>
+#include <ratio>
+#include <chrono>
+#include <time.h>
+#include <stdlib.h>
+
+using namespace std;
+
+#define SM3_HASH_SIZE 32
+namespace SM3 {
+	/*哈希值向量大小，单位为字节*/
+	typedef struct SM3Context {
+		unsigned int intermediateHash[SM3_HASH_SIZE / 4];
+		unsigned char messageBlock[64];//512位的数据块，是迭代压缩的对象
+	} SM3Context;
+
+	unsigned char* SM3Calc(const unsigned char* message,
+		unsigned int messageLen, unsigned char digest[SM3_HASH_SIZE]);
+
+	vector<uint32_t> call_hash_sm3(char* filepath);
+
+	double progress();
+}
+
+#define MAX_CHAR_NUM 1024*512
+#define MAXSIZE 1024*MAX_CHAR_NUM  //假设加密文件最大为2KB
+
+uint32_t hash_all = 0;  //总消息块
+uint32_t hash_rate = 0;  //hash进度
+uint32_t t[64];  //预计算常量t
+
+/*计算当前哈希进度*/
+double progress() {
+	return (double(hash_rate) / hash_all);
+}
+
+/*判断运行环境是否为小端*/
+static const int endianTest = 1;
+#define IsLittleEndian() (*(char *)&endianTest == 1)
+/*向左循环移位*/
+#define LeftRotate(word, bits) ( (word) << (bits) | (word) >> (32 - (bits)) )
+/*反转四字节整型字节的次序*/
+uint32_t* ReverseWord(uint32_t* word)
+{
+	uint8_t* byte, temp;
+
+	byte = (uint8_t*)word;
+	temp = byte[0];
+	byte[0] = byte[3];
+	byte[3] = temp;
+
+	temp = byte[1];
+	byte[1] = byte[2];
+	byte[2] = temp;
+	return word;
+
+}
+/*T常量*/
+uint32_t T(int i)
+{
+	if (i >= 0 && i <= 15)
+		return 0x79CC4519;
+	else if (i >= 16 && i <= 63)
+		return 0x7A879D8A;
+	else
+		return 0;
+}
+
+/*预计算T常量*/
+void caculT() {
+	for (int i = 0; i < 64; i++) {
+		t[i] = LeftRotate(T(i), i);
+	}
+	return;
+}
+
+/*FF*/
+uint32_t FF(uint32_t X, uint32_t Y, uint32_t Z, int i)
+{
+	if (i >= 0 && i <= 15)
+		return X ^ Y ^ Z;
+	else if (i >= 16 && i <= 63)
+		return (X & Y) | (X & Z) | (Y & Z);
+	else
+		return 0;
+}
+
+/*GG*/
+uint32_t GG(uint32_t X, uint32_t Y, uint32_t Z, int i)
+{
+	if (i >= 0 && i <= 15)
+		return X ^ Y ^ Z;
+	else if (i >= 16 && i <= 63)
+		return (X & Y) | (~X & Z);
+	else
+		return 0;
+}
+
+/*P0*/
+uint32_t P0(uint32_t X)
+{
+	return X ^ LeftRotate(X, 9) ^ LeftRotate(X, 17);
+}
+
+/*P1*/
+uint32_t P1(uint32_t X)
+{
+	return X ^ LeftRotate(X, 15) ^ LeftRotate(X, 23);
+}
+
+/*初始化函数*/
+void SM3Init(SM3::SM3Context* context) {
+	context->intermediateHash[0] = 0x7380166F;
+	context->intermediateHash[1] = 0x4914B2B9;
+	context->intermediateHash[2] = 0x172442D7;
+	context->intermediateHash[3] = 0xDA8A0600;
+	context->intermediateHash[4] = 0xA96F30BC;
+	context->intermediateHash[5] = 0x163138AA;
+	context->intermediateHash[6] = 0xE38DEE4D;
+	context->intermediateHash[7] = 0xB0FB0E4E;
+}
+
+
+/*新一轮压缩算法*/
+void one_round(int i, uint32_t& A, uint32_t& B, uint32_t& C, uint32_t& D,
+	uint32_t& E, uint32_t& F, uint32_t& G, uint32_t& H, uint32_t W[68], SM3::SM3Context* context)
+{
+	uint32_t SS1 = 0, SS2 = 0, TT1 = 0, TT2 = 0;
+	//计算消息扩展字W(i+4)
+	if (i < 12) {
+		W[i + 4] = *(uint32_t*)(context->messageBlock + (i + 4) * 4);
+		if (IsLittleEndian())
+			ReverseWord(W + i + 4);
+	}
+	else {
+		/*P1*/
+		W[i + 4] = ((W[i - 12] ^ W[i - 5] ^ LeftRotate(W[i + 1], 15)) ^ LeftRotate((W[i - 12] ^ W[i - 5] ^ LeftRotate(W[i + 1], 15)), 15) ^ LeftRotate((W[i - 12] ^ W[i - 5] ^ LeftRotate(W[i + 1], 15)), 23))
+			^ LeftRotate(W[i - 9], 7)
+			^ W[i - 2];
+	}
+
+	//计算中间变量TT1和TT2
+	TT2 = LeftRotate(A, 12);
+	TT1 = TT2 + E + t[i];
+	TT1 = LeftRotate(TT1, 7);
+	TT2 ^= TT1;
+
+	//更新字寄存器B、D、F、H
+	D = D + FF(A, B, C, i) + TT2 + (W[i] ^ W[i + 4]);
+	H = H + GG(E, F, G, i) + TT1 + W[i];
+	B = LeftRotate(B, 9);
+	F = LeftRotate(F, 19);
+	H = H ^ LeftRotate(H, 9) ^ LeftRotate(H, 17);
+}
+
+/* 处理消息块*/
+void SM3ProcessMessageBlock(SM3::SM3Context* context)
+{
+	int i;
+	uint32_t W[68];
+	//A-H是8个字寄存器
+	uint32_t A, B, C, D, E, F, G, H;
+
+	/* 消息扩展 */
+
+	for (i = 0; i < 4; i++)
+	{
+		W[i] = *(uint32_t*)(context->messageBlock + i * 4);
+		if (IsLittleEndian())
+			ReverseWord(W + i);
+		//  printf("%d: %x\n", i, W[i]);
+	}
+
+	/* 消息压缩 */
+	A = context->intermediateHash[0];
+	B = context->intermediateHash[1];
+	C = context->intermediateHash[2];
+	D = context->intermediateHash[3];
+	E = context->intermediateHash[4];
+	F = context->intermediateHash[5];
+	G = context->intermediateHash[6];
+	H = context->intermediateHash[7];
+	for (i = 0; i <= 60; i += 4)
+	{
+		one_round(i, A, B, C, D, E, F, G, H, W, context);
+		one_round(i + 1, D, A, B, C, H, E, F, G, W, context);
+		one_round(i + 2, C, D, A, B, G, H, E, F, W, context);
+		one_round(i + 3, B, C, D, A, F, G, H, E, W, context);
+
+	}
+	context->intermediateHash[0] ^= A;
+	context->intermediateHash[1] ^= B;
+	context->intermediateHash[2] ^= C;
+	context->intermediateHash[3] ^= D;
+	context->intermediateHash[4] ^= E;
+	context->intermediateHash[5] ^= F;
+	context->intermediateHash[6] ^= G;
+	context->intermediateHash[7] ^= H;
+}
+
+/*  SM3算法主函数:
+	message代表需要加密的消息字节串;
+	messagelen是消息的字节数;
+	digset表示返回的哈希值
+*/
+uint8_t* SM3::SM3Calc(const uint8_t* message, uint32_t messageLen, uint8_t digest[SM3_HASH_SIZE])
+{
+	SM3::SM3Context context;
+	uint32_t i, remainder, bitLen;
+
+	/* 初始化 */
+	SM3Init(&context);  //设置IV的初始值
+	hash_all = messageLen / 64 + 1;  //计算总块数
+	remainder = messageLen % 64;
+	if (remainder > 55) {
+		hash_all += 1;
+	}
+	/* 对消息分组进行处理 */
+	for (i = 0; i < messageLen / 64; i++)
+	{
+		memcpy(context.messageBlock, message + i * 64, 64);
+		hash_rate = i + 1;  //每处理512bit进度就+1
+		SM3ProcessMessageBlock(&context);
+	}
+
+	/* 填充消息分组 */
+	bitLen = messageLen * 8;
+	if (IsLittleEndian())
+		ReverseWord(&bitLen);
+	memcpy(context.messageBlock, message + i * 64, remainder);
+	context.messageBlock[remainder] = 0x80;
+	if (remainder <= 55)  //如果剩下的少于440bit
+	{
+		memset(context.messageBlock + remainder + 1, 0, 64 - remainder - 1 - 8 + 4);
+		memcpy(context.messageBlock + 64 - 4, &bitLen, 4);
+		hash_rate += 1;  //计算最后一个短块
+		SM3ProcessMessageBlock(&context);
+	}
+	else
+	{
+		memset(context.messageBlock + remainder + 1, 0, 64 - remainder - 1);
+		hash_rate += 1;  //计算短块
+		SM3ProcessMessageBlock(&context);
+		memset(context.messageBlock, 0, 64 - 4);
+		memcpy(context.messageBlock + 64 - 4, &bitLen, 4);
+		hash_rate += 1;  //计算最后一个短块
+		SM3ProcessMessageBlock(&context);
+	}
+
+	/* 返回结果 */
+	if (IsLittleEndian())
+		for (i = 0; i < 8; i++)
+			ReverseWord(context.intermediateHash + i);
+	memcpy(digest, context.intermediateHash, SM3_HASH_SIZE);
+
+	return digest;
+}
+
+/*  call_hash_sm3函数
+	输入参数：文件地址字符串
+	输出：向量vector<unit32_t> hash_result(32)
+*/
+vector<uint32_t> SM3::call_hash_sm3(char* filepath)
+{
+	vector<uint32_t> hash_result(32, 0);
+	ifstream infile;
+	uint32_t FILESIZE = 0;
+	uint8_t* buffer = new unsigned char[MAXSIZE];
+	uint8_t hash_output[32];
+	/*获取文件大小*/
+	struct _stat info;
+	_stat(filepath, &info);
+	FILESIZE = info.st_size;
+	/*打开文件*/
+	infile.open(filepath, ifstream::binary);
+	infile >> buffer;
+	auto start = chrono::high_resolution_clock::now();
+	SM3::SM3Calc(buffer, FILESIZE, hash_output);
+	auto end = chrono::high_resolution_clock::now();
+	// 以毫秒为单位，返回所用时间
+	cout << "in millisecond time:";
+	chrono::duration<double, ratio<1, 1000>> diff = end - start;
+	cout << "Time is " << diff.count() << " ms\n";
+	/*	printf("Hash:\n   ");
+		for (int i = 0; i < 32; i++)
+		{
+			printf("%02x", hash_output[i]);
+			if (((i + 1) % 4) == 0) printf(" ");
+		}
+		printf("\n");
+	*/
+	hash_result.assign(&hash_output[0], &hash_output[32]);
+	/*	for (int i = 0; i < 32; i++) {
+			cout <<hex << setw(2) << setfill('0') << hash_result[i];
+			if (((i + 1) % 4) == 0) cout <<" ";
+		}
+		cout << endl;
+	*/
+	delete[]buffer;
+	return hash_result;
+}
+
+/*创建固定大小的文件*/
+void CreatTxt(char* pathName, int length)  //创建txt文件
+{
+	ofstream fout(pathName);
+	char char_list[] = "abcdefghijklmnopqrstuvwxyz";
+	int n = 26;
+	if (fout) {
+		for (int i = 0; i < length; i++)
+		{
+			fout << char_list[rand() % n];
+		}
+
+		fout.close();
+	}
+}
+
+/*测试函数*/
+int main() {
+	char filepath[] = "test.txt";
+	CreatTxt(filepath, MAX_CHAR_NUM);
+	vector<uint32_t> hash_result;
+	caculT();
+	hash_result = SM3::call_hash_sm3(filepath);
+	for (int i = 0; i < 32; i++) {
+		cout << hex << setw(2) << setfill('0') << hash_result[i];
+		if (((i + 1) % 4) == 0) cout << " ";
+	}
+	cout << endl;
+
+	double rate = progress();
+	printf("\n当前进度: %f", rate);
+
+	return 0;
+}
